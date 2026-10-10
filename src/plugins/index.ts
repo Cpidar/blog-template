@@ -1,0 +1,157 @@
+import { redirectsPlugin } from '@payloadcms/plugin-redirects'
+import { seoPlugin } from '@payloadcms/plugin-seo'
+import { searchPlugin } from '@payloadcms/plugin-search'
+import { Plugin } from 'payload'
+import { revalidateRedirects } from '@/hooks/revalidateRedirects'
+import { GenerateTitle, GenerateURL } from '@payloadcms/plugin-seo/types'
+import { searchFields } from '@/search/fieldOverrides'
+import { beforeSyncWithSearch } from '@/search/beforeSync'
+import { pageTreePlugin } from '@delmaredigital/payload-page-tree'
+import { createPuckPlugin } from '@delmaredigital/payload-puck/plugin'
+import { puckLayoutOptions } from '@/lib/puck/layout-options'
+import {
+  betterAuthCollections,
+  createBetterAuthPlugin,
+  payloadAdapter,
+} from '@delmaredigital/payload-better-auth'
+import { betterAuthOptions } from '@/lib/auth/config'
+import { betterAuth } from 'better-auth'
+
+import { Page, Post } from '@/payload-types'
+import { getServerSideURL } from '@/utilities/getURL'
+import { admin, isAdmin } from '@/access/admin'
+import { adminOrPublished } from '@/access/adminOrPublished'
+
+const generateTitle: GenerateTitle<Post | Page> = ({ doc }) => {
+  return doc?.title ? `${doc.title} | DD Starter` : 'DD Starter'
+}
+
+const generateURL: GenerateURL<Post | Page> = ({ doc }) => {
+  const url = getServerSideURL()
+
+  return doc?.slug ? `${url}/${doc.slug}` : url
+}
+
+export const plugins: Plugin[] = [
+  // Better Auth - collections must come before createBetterAuthPlugin
+  betterAuthCollections({
+    betterAuthOptions,
+    skipCollections: ['user'], // We define Users ourselves
+  }),
+  // Initialize Better Auth with auto-injected endpoints and admin components
+  createBetterAuthPlugin({
+    createAuth: (payload) =>
+      betterAuth({
+        ...betterAuthOptions,
+        database: payloadAdapter({
+          payloadClient: payload,
+          adapterConfig: {
+            enableDebugLogs: false,
+          },
+        }),
+        // For Payload's default SERIAL IDs:
+        advanced: {
+          database: {
+            generateId: 'serial',
+          },
+        },
+        secret: process.env.BETTER_AUTH_SECRET,
+        trustedOrigins: [
+          'http://localhost:3000',
+          'https://localhost:3000',
+          process.env.NEXT_PUBLIC_APP_URL,
+        ].filter(Boolean) as string[],
+      }),
+    admin: {
+      betterAuthOptions, // Required for management UI auto-detection
+      // payload-better-auth 0.9+: the default login view no longer imports the
+      // optional passkey peer. Point at the passkey-enabled wrapper to keep
+      // passkey sign-in on the admin login.
+      loginViewComponent:
+        '@delmaredigital/payload-better-auth/components/login-passkey#LoginViewWrapperWithPasskey',
+      login: {
+        enablePasskey: true, // Enable passkey sign-in option
+        afterLoginPath: '/admin/page-tree', // Redirect to page tree after login
+      },
+      apiKey: {
+        requiredRole: 'admin',
+      },
+    },
+  }),
+  // Puck - visual page editor (must run BEFORE page-tree so Pages collection exists)
+  createPuckPlugin({
+    pagesCollection: 'pages',
+    // Only admins author pages; the public reads published pages only.
+    access: {
+      read: adminOrPublished,
+      create: admin,
+      update: admin,
+      delete: admin,
+      readVersions: admin,
+    },
+    layouts: puckLayoutOptions,
+    // Built by 'build:puck-css' (Tailwind CLI) into public/ — same URL in dev
+    // and production.
+    editorStylesheets: ['/puck-editor-styles.css'],
+  }),
+  // Page Tree - hierarchical URL management (runs after Puck creates Pages)
+  pageTreePlugin({
+    collections: ['pages', 'posts'],
+    folderSlug: 'payload-folders',
+    segmentFieldName: 'pathSegment',
+    pageSegmentFieldName: 'pageSegment',
+    // Gate the /api/page-tree/* endpoints (the plugin also enforces collection
+    // access on every operation; this stops non-admins at the door).
+    access: ({ req }) => isAdmin(req.user),
+    customizeFolderCollection: (collection) => ({
+      ...collection,
+      access: {
+        ...((collection.access as Record<string, unknown> | undefined) ?? {}),
+        create: admin,
+        update: admin,
+        delete: admin,
+      },
+    }),
+  }),
+  // Redirects
+  redirectsPlugin({
+    collections: ['pages', 'posts'],
+    overrides: {
+      access: { create: admin, update: admin, delete: admin },
+      // @ts-expect-error - This is a valid override, mapped fields don't resolve to the same type
+      fields: ({ defaultFields }) => {
+        return defaultFields.map((field) => {
+          if ('name' in field && field.name === 'from') {
+            return {
+              ...field,
+              admin: {
+                description: 'You will need to rebuild the website when changing this field.',
+              },
+            }
+          }
+          return field
+        })
+      },
+      hooks: {
+        afterChange: [revalidateRedirects],
+      },
+    },
+  }),
+  // SEO
+  seoPlugin({
+    generateTitle,
+    generateURL,
+  }),
+  // Search
+  searchPlugin({
+    collections: ['posts'],
+    beforeSync: beforeSyncWithSearch,
+    searchOverrides: {
+      // The plugin syncs records itself; nobody creates them by hand.
+      access: { update: admin, delete: admin },
+      fields: ({ defaultFields }) => {
+        return [...defaultFields, ...searchFields]
+      },
+    },
+  }),
+]
